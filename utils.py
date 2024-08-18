@@ -1,14 +1,40 @@
+import io
 import os
 
 import boto3
 import cv2
 import numpy as np
-from skimage.feature import graycomatrix, graycoprops
+from PIL import Image
+from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
 
 from dotenv import load_dotenv
 
 # 환경 변수 다운로드
 load_dotenv()
+
+
+def ndarray_to_image(s3_conn, response, image_name):
+    # Min-Max scaling을 통해 값을 [0, 255] 범위로 조정
+    min_val = response.min()
+    max_val = response.max()
+    scaled_array = (response - min_val) / (max_val - min_val) * 255
+    image = Image.fromarray(scaled_array.astype(np.uint8))
+
+    # 이미지 데이터를 바이트 배열로 변환
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    # AWS S3에 업로드
+    bucket_name = s3_conn.bucket  # 버킷 이름
+
+    # 업로드
+    s3_conn.upload_fileobj(buffer, bucket_name, image_name)
+
+    # 업로드된 이미지의 URL 생성
+    image_url = f"https://{bucket_name}.s3.amazonaws.com/{image_name}"
+
+    return image_url
 
 
 def download_image(object_key):
@@ -67,3 +93,110 @@ def create_texture_info(image):
     }
     print("Success to extract texture info from image")
     return texture_result
+
+
+def lbp_calculate(s3_conn, image, meat_id, seqno):
+    # 이미지가 컬러 이미지인 경우 그레이스케일로 변환
+    if len(image.shape) == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # LBP 결과를 저장할 배열 생성
+    lbp1 = np.zeros_like(image)
+
+    # 각 픽셀에 대해 LBP 계산
+    for i in range(1, image.shape[0] - 1):
+        for j in range(1, image.shape[1] - 1):
+            # 중심 픽셀 값
+            center = image[i, j]
+            # 주변 8개 픽셀 값과 비교하여 이진 패턴 생성
+            binary_pattern = 0
+            binary_pattern |= (image[i - 1, j - 1] >= center) << 7
+            binary_pattern |= (image[i - 1, j] >= center) << 6
+            binary_pattern |= (image[i - 1, j + 1] >= center) << 5
+            binary_pattern |= (image[i, j + 1] >= center) << 4
+            binary_pattern |= (image[i + 1, j + 1] >= center) << 3
+            binary_pattern |= (image[i + 1, j] >= center) << 2
+            binary_pattern |= (image[i + 1, j - 1] >= center) << 1
+            binary_pattern |= (image[i, j - 1] >= center) << 0
+            # 결과 저장
+            lbp1[i, j] = binary_pattern
+
+    # Compute LBP
+    radius = 3
+    n_points = 8 * radius
+    lbp2 = local_binary_pattern(image, n_points, radius, method='uniform')
+
+    print("Success to create lbp images")
+
+    # Save the LBP image
+    image_name1 = f'openCV_images/{meat_id}-{seqno}-lbp1-{i + 1}.png'
+    image_name2 = f'openCV_images/{meat_id}-{seqno}-lbp2-{i + 1}.png'
+
+    print(image_name1, image_name2)
+
+    lbp_image1 = ndarray_to_image(s3_conn, lbp1, image_name1)
+    lbp_image2 = ndarray_to_image(s3_conn, lbp2, image_name2)
+
+    result = {
+        "lbp1": lbp_image1,
+        "lbp2": lbp_image2
+    }
+
+    return result
+
+
+def create_gabor_kernels(ksize, sigma, lambd, gamma, psi, num_orientations):
+    kernels = []
+    for theta in np.linspace(0, np.pi, num_orientations, endpoint=False):
+        kernel = cv2.getGaborKernel((ksize, ksize), sigma, theta, lambd, gamma, psi, ktype=cv2.CV_32F)
+        kernels.append(kernel)
+    return kernels
+
+
+def apply_gabor_kernels(img, kernels):
+    responses = []
+    for kernel in kernels:
+        response = cv2.filter2D(img, cv2.CV_32F, kernel)
+        responses.append(response)
+    return responses
+
+
+def compute_texture_features(responses):
+    features = []
+    for response in responses:
+        mean = np.mean(response)
+        std_dev = np.std(response)
+        energy = np.sum(response ** 2)
+        features.append([mean, std_dev, energy])
+    return features
+
+
+def gabor_texture_analysis(s3_conn, image, id, seqno):
+    img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Gabor 필터 파라미터
+    ksize = 31
+    sigma = 4.0
+    lambd = 10.0
+    gamma = 0.5
+    psi = 0
+    num_orientations = 8  # 방향의 수
+
+    kernels = create_gabor_kernels(ksize, sigma, lambd, gamma, psi, num_orientations)
+    responses = apply_gabor_kernels(img, kernels)
+    features = compute_texture_features(responses)
+    print("Success to create gabor images")
+
+    result = {}
+    for i, response in enumerate(responses):
+        image_name = f'openCV_images/{id}-{seqno}-garbor-{i + 1}.png'
+        image_path = ndarray_to_image(s3_conn, response, image_name)
+
+        result[i + 1] = {
+            "images": image_path,
+            "mean": float(features[i][0]),
+            "std_dev": float(features[i][1]),
+            "energy": float(features[i][2])
+        }
+
+    return result
